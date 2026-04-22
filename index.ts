@@ -1,5 +1,5 @@
-import { streamSimple, type AssistantMessage, type Message, type Model } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ImageContent, Model } from "@mariozechner/pi-ai";
+import { buildSessionContext, createAgentSession, SessionManager, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 type Alias = "claude" | "codex" | "kimi" | "glm";
 
@@ -8,6 +8,8 @@ type ModelBinding = {
   modelId: string;
   label: string;
 };
+
+type WorkerToolMode = "none" | "read-only" | "full";
 
 interface MeshRound {
   id: string;
@@ -23,6 +25,7 @@ interface MeshRound {
 const SYNTHETIC_GLM_PROVIDER = process.env.MESH_SYNTHETIC_PROVIDER?.trim() || "synthetic";
 const SYNTHETIC_BASE_URL = process.env.SYNTHETIC_BASE_URL?.trim() || "https://api.synthetic.new/v1";
 const SYNTHETIC_API_KEY_ENV = process.env.SYNTHETIC_API_KEY_ENV?.trim() || "SYNTHETIC_API_KEY";
+const LEGACY_WORKER_INSTRUCTIONS = process.env.MESH_SYSTEM_PROMPT?.trim();
 
 const MODEL_MAP: Record<Alias, ModelBinding> = {
   claude: {
@@ -48,6 +51,18 @@ const MODEL_MAP: Record<Alias, ModelBinding> = {
 };
 
 const ORDER: Alias[] = ["claude", "codex", "kimi", "glm"];
+const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
+const FULL_TOOLS = ["read", "grep", "find", "ls", "bash", "edit", "write"] as const;
+
+function parseWorkerToolMode(value: string | undefined): WorkerToolMode {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "none") return "none";
+  if (normalized === "full") return "full";
+  if (normalized === "readonly" || normalized === "read-only" || normalized === "read_only") return "read-only";
+  return "read-only";
+}
+
+const WORKER_TOOL_MODE = parseWorkerToolMode(process.env.MESH_TOOL_MODE);
 
 function stripTags(text: string): string {
   return text.replace(/(^|\s)@[a-zA-Z0-9:_-]+/g, " ").replace(/\s+/g, " ").trim();
@@ -98,12 +113,18 @@ function parseInput(text: string): {
   };
 }
 
-function assistantText(msg: AssistantMessage): string {
+function textFromMessage(msg: { content?: Array<{ type: string; text?: string }> } | null | undefined): string {
+  if (!msg?.content) return "";
   return msg.content
     .filter((c): c is { type: "text"; text: string } => c.type === "text")
     .map((c) => c.text)
     .join("\n")
     .trim();
+}
+
+function cloneValue<T>(value: T): T {
+  if (typeof globalThis.structuredClone === "function") return globalThis.structuredClone(value);
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function buildDeliberationPrompt(userPrompt: string, last: MeshRound | undefined): string {
@@ -148,6 +169,16 @@ function buildJudgePrompt(userPrompt: string, outputs: Partial<Record<Alias, str
   ].join("\n");
 }
 
+function applyWorkerInstructions(prompt: string): string {
+  if (!LEGACY_WORKER_INSTRUCTIONS) return prompt;
+  return [
+    "# Additional model-mesh instructions",
+    LEGACY_WORKER_INSTRUCTIONS,
+    "",
+    prompt,
+  ].join("\n");
+}
+
 function formatRound(round: MeshRound): string {
   const rows = ORDER
     .filter((a) => round.targets.includes(a))
@@ -179,48 +210,74 @@ function updateLiveWidget(ctx: any, targets: Alias[], partials: Partial<Record<A
   ctx.ui.setWidget("model-mesh-live", lines, { placement: "belowEditor" });
 }
 
-const DEFAULT_SYSTEM_PROMPT = process.env.MESH_SYSTEM_PROMPT?.trim() || "You are a helpful coding assistant.";
+function getWorkerTools(mode: WorkerToolMode): string[] {
+  if (mode === "none") return [];
+  return [...(mode === "full" ? FULL_TOOLS : READ_ONLY_TOOLS)];
+}
 
-async function streamModel(
+function findLastAssistantText(messages: Array<{ role?: string; content?: Array<{ type: string; text?: string }> }>): string {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]?.role !== "assistant") continue;
+    const text = textFromMessage(messages[i]);
+    if (text) return text;
+  }
+  return "";
+}
+
+async function runWorkerSession(
   model: Model<any>,
   prompt: string,
   ctx: any,
-  onChunk: (chunk: string, full: string) => void,
+  history: unknown[],
+  images: ImageContent[] | undefined,
+  thinkingLevel: ReturnType<ExtensionAPI["getThinkingLevel"]>,
+  onUpdate: (full: string) => void,
 ): Promise<string> {
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok || !auth.apiKey) {
-    const msg = auth.ok ? `Missing API key for ${model.provider}/${model.id}` : auth.error;
-    throw new Error(msg);
-  }
-
-  const user: Message = {
-    role: "user",
-    content: [{ type: "text", text: prompt }],
-    timestamp: Date.now(),
-  };
-
-  const events = streamSimple(model, { systemPrompt: DEFAULT_SYSTEM_PROMPT, messages: [user] }, {
-    apiKey: auth.apiKey,
-    headers: auth.headers,
-    signal: ctx.signal,
+  // Use a real pi session so routed models inherit context files, skills, and workspace tools.
+  const { session } = await createAgentSession({
+    cwd: ctx.cwd,
+    model,
+    thinkingLevel,
+    sessionManager: SessionManager.inMemory(ctx.cwd),
+    tools: getWorkerTools(WORKER_TOOL_MODE),
   });
 
-  let full = "";
-  for await (const event of events) {
-    if (event.type === "text_delta") {
-      full += event.delta;
-      onChunk(event.delta, full);
-    }
-    if (event.type === "done") {
-      const doneText = assistantText(event.message);
-      return doneText || full;
-    }
-    if (event.type === "error") {
-      throw new Error(event.error.errorMessage || "Unknown streaming error");
-    }
-  }
+  try {
+    for (const message of history) session.sessionManager.appendMessage(cloneValue(message) as any);
+    session.agent.state.messages = cloneValue(history) as any;
 
-  return full.trim();
+    let streamingText = "";
+    let finalText = "";
+
+    const unsubscribe = session.subscribe((event) => {
+      if (event.type === "message_start" && event.message.role === "assistant") {
+        streamingText = textFromMessage(event.message);
+        if (streamingText) onUpdate(streamingText);
+        return;
+      }
+
+      if (event.type === "message_update" && event.message.role === "assistant" && event.assistantMessageEvent.type === "text_delta") {
+        streamingText += event.assistantMessageEvent.delta;
+        onUpdate(streamingText);
+        return;
+      }
+
+      if (event.type === "message_end" && event.message.role === "assistant") {
+        finalText = textFromMessage(event.message) || streamingText;
+        if (finalText) onUpdate(finalText);
+      }
+    });
+
+    try {
+      await session.prompt(prompt, { images, source: "extension" });
+    } finally {
+      unsubscribe();
+    }
+
+    return finalText || findLastAssistantText(session.messages as any) || streamingText.trim();
+  } finally {
+    session.dispose();
+  }
 }
 
 export default function modelMeshExtension(pi: ExtensionAPI) {
@@ -270,7 +327,11 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
   pi.registerCommand("mesh-doctor", {
     description: "Diagnose model/auth wiring for @claude/@codex/@kimi/@glm",
     handler: async (_args, ctx) => {
-      const lines: string[] = ["Model Mesh doctor:"];
+      const lines: string[] = [
+        "Model Mesh doctor:",
+        `- workspace tools: ${WORKER_TOOL_MODE} (${getWorkerTools(WORKER_TOOL_MODE).join(", ") || "none"})`,
+        `- cwd: ${ctx.cwd}`,
+      ];
 
       for (const alias of ORDER) {
         const bind = MODEL_MAP[alias];
@@ -320,9 +381,11 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
     };
 
     const last = rounds.at(-1);
-    const workerPrompt = parsed.deliberation
+    const workerPrompt = applyWorkerInstructions(parsed.deliberation
       ? buildDeliberationPrompt(parsed.cleanedPrompt, last)
-      : parsed.cleanedPrompt;
+      : parsed.cleanedPrompt);
+    const history = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages as unknown[];
+    const thinkingLevel = pi.getThinkingLevel();
 
     const partials: Partial<Record<Alias | "judge", string>> = {};
 
@@ -346,7 +409,7 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
           }
 
           try {
-            const txt = await streamModel(model, workerPrompt, ctx, (_chunk, full) => {
+            const txt = await runWorkerSession(model, workerPrompt, ctx, history, event.images, thinkingLevel, (full) => {
               partials[alias] = full;
               updateLiveWidget(ctx, parsed.targets, partials);
             });
@@ -359,7 +422,7 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
               const fallback = ctx.modelRegistry.find("synthetic", bind.modelId);
               if (fallback) {
                 try {
-                  const txt = await streamModel(fallback, workerPrompt, ctx, (_chunk, full) => {
+                  const txt = await runWorkerSession(fallback, workerPrompt, ctx, history, event.images, thinkingLevel, (full) => {
                     partials[alias] = full;
                     updateLiveWidget(ctx, parsed.targets, partials);
                   });
@@ -385,9 +448,9 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
         if (!judgeModel) {
           round.judged = `Error: judge model not found (${judgeBind.provider}/${judgeBind.modelId})`;
         } else {
-          const judgePrompt = buildJudgePrompt(parsed.cleanedPrompt, round.outputs, parsed.chosenJudge);
+          const judgePrompt = applyWorkerInstructions(buildJudgePrompt(parsed.cleanedPrompt, round.outputs, parsed.chosenJudge));
           try {
-            const judged = await streamModel(judgeModel, judgePrompt, ctx, (_chunk, full) => {
+            const judged = await runWorkerSession(judgeModel, judgePrompt, ctx, history, event.images, thinkingLevel, (full) => {
               partials.judge = full;
               updateLiveWidget(ctx, parsed.targets, partials);
             });

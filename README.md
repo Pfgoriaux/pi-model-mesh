@@ -4,6 +4,8 @@
 
 Tag multiple AI models in a single chat message. They run in parallel, stream live previews, and can deliberate or judge each other's outputs.
 
+Workers run as real pi sessions, seeded from the current branch context, so they inherit project instructions and can inspect the workspace. By default they use read-only tools (`read`, `grep`, `find`, `ls`).
+
 ---
 
 ## Tags
@@ -118,7 +120,8 @@ All defaults can be overridden without modifying code:
 | `MESH_MODEL_KIMI` | `kimi-for-coding` | Kimi model ID |
 | `MESH_SYNTHETIC_PROVIDER` | `synthetic` | GLM provider name (change only for custom proxies) |
 | `MESH_MODEL_GLM` | `hf:zai-org/GLM-5.1` | GLM model ID |
-| `MESH_SYSTEM_PROMPT` | `You are a helpful coding assistant.` | System prompt for worker calls |
+| `MESH_SYSTEM_PROMPT` | unset | Optional extra instructions prepended to worker prompts |
+| `MESH_TOOL_MODE` | `read-only` | Worker tool access: `read-only`, `full`, or `none` |
 | `SYNTHETIC_BASE_URL` | `https://api.synthetic.new/v1` | Override Synthetic API URL (only when `MESH_SYNTHETIC_PROVIDER` is changed) |
 | `SYNTHETIC_API_KEY_ENV` | `SYNTHETIC_API_KEY` | Env var name for Synthetic API key (only for custom provider bridge) |
 
@@ -133,6 +136,7 @@ All defaults can be overridden without modifying code:
 | Codex says model unsupported | Switch to a model your plan supports, e.g. `MESH_MODEL_CODEX=gpt-5.3-codex` |
 | Kimi auth fails intermittently | Use `/login kimi-coding`; don't rely on a stale `KIMI_API_KEY` |
 | Tags do nothing | Make sure there's text after the tags, e.g. `@claude hello` not just `@claude` |
+| Models ask for repo/files instead of inspecting them | Leave `MESH_TOOL_MODE` at `read-only` or switch it back from `none`, then `/reload` |
 
 ---
 
