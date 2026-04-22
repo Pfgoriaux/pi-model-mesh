@@ -1,0 +1,60 @@
+{
+  "name": "pi-model-mesh",
+  "version": "0.1.0",
+  "description": "Multi-model orchestration extension for pi (@claude, @codex, @kimi, @glm, @all, @judge)",
+  "license": "MIT",
+  "type": "module",
+  "author": "PF Goriaux",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Pfgoriaux/pi-model-mesh.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Pfgoriaux/pi-model-mesh/issues"
+  },
+  "homepage": "https://github.com/Pfgoriaux/pi-model-mesh#readme",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "multi-model",
+    "synthetic",
+    "kimi",
+    "codex",
+    "claude"
+  ],
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": "./index.ts"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@mariozechner/pi-ai": {
+      "optional": false
+    },
+    "@mariozechner/pi-coding-agent": {
+      "optional": false
+    }
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "lint": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@mariozechner/pi-ai": "^0.68.1",
+    "@mariozechner/pi-coding-agent": "^0.68.1",
+    "typescript": "^6.0.3"
+  }
+}

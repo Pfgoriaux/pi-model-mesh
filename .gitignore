@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build
+*.tsbuildinfo
+dist/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+auth.json
+*.pem
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Pi local state
+.pi/

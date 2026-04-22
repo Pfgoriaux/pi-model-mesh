@@ -1,0 +1,151 @@
+# Model Mesh — pi extension
+
+> Multi-model orchestration for [pi](https://github.com/mariozechner/pi-coding-agent) with tag-based routing, parallel streaming, deliberation, and judge synthesis.
+
+Tag multiple AI models in a single chat message. They run in parallel, stream live previews, and can deliberate or judge each other's outputs.
+
+---
+
+## Tags
+
+| Tag | Effect |
+|---|---|
+| `@claude` | Route to Claude |
+| `@codex` | Route to Codex |
+| `@kimi` | Route to Kimi (plan) |
+| `@glm` | Route to GLM via Synthetic |
+| `@all` | Route to every model above |
+| `@judge` | After all models respond, one model synthesizes a final decision |
+| `@judge:<model>` | Choose which model judges (default: Claude) |
+| `@deliberate` / `@debate` | Feeds previous round findings into the next, so models critique and refine |
+
+---
+
+## Quick examples
+
+```text
+@codex @claude compare approach A vs B for the migration
+@all produce a migration plan for the auth module
+@glm summarize tradeoffs for this architecture
+@all @deliberate challenge previous answers and converge on one plan
+@all @judge pick the best and produce final implementation plan
+@claude @codex @judge:kimi synthesize into one final decision
+```
+
+---
+
+## Default model routing
+
+| Tag | Provider | Model |
+|---|---|---|
+| `@claude` | `anthropic` | `claude-sonnet-4-5` |
+| `@codex` | `openai-codex` | `gpt-5.3-codex` |
+| `@kimi` | `kimi-coding` | `kimi-for-coding` |
+| `@glm` | `synthetic` | `hf:zai-org/GLM-5.1` |
+
+All defaults are overridable via environment variables (see below).
+
+---
+
+## Prerequisites
+
+- **[pi](https://github.com/mariozechner/pi-coding-agent)** must be installed.
+- Each model's provider must be configured in pi with valid credentials. Run `/mesh-doctor` after install to verify.
+
+**Recommended companion providers:**
+
+| Provider | Install | Auth |
+|---|---|---|
+| Synthetic (for `@glm`) | `pi install npm:@aliou/pi-synthetic` | API key in `~/.pi/agent/auth.json` or `SYNTHETIC_API_KEY` env var |
+| Kimi plan (for `@kimi`) | `pi install npm:pi-provider-kimi-code` | `/login kimi-coding` |
+
+Claude and Codex are built into pi and only need their standard API keys.
+
+---
+
+## Install
+
+### Option A — as a pi package (recommended)
+
+From a published npm package or directly from GitHub:
+
+```bash
+pi install npm:pi-model-mesh
+# or from git:
+pi install git:github.com/Pfgoriaux/pi-model-mesh
+```
+
+Then in pi:
+
+```text
+/reload
+```
+
+### Option B — copy the file
+
+```bash
+cp ./index.ts ~/.pi/agent/extensions/model-mesh.ts
+```
+
+Then in pi:
+
+```text
+/reload
+```
+
+---
+
+## Commands
+
+| Command | Description |
+|---|---|
+| `/mesh-doctor` | Diagnose provider/model binding and auth for all tags |
+| `/mesh-clear` | Clear in-session model-mesh round history |
+
+---
+
+## Environment variables
+
+All defaults can be overridden without modifying code:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MESH_PROVIDER_CLAUDE` | `anthropic` | Claude provider name |
+| `MESH_MODEL_CLAUDE` | `claude-sonnet-4-5` | Claude model ID |
+| `MESH_PROVIDER_CODEX` | `openai-codex` | Codex provider name |
+| `MESH_MODEL_CODEX` | `gpt-5.3-codex` | Codex model ID |
+| `MESH_PROVIDER_KIMI` | `kimi-coding` | Kimi provider name |
+| `MESH_MODEL_KIMI` | `kimi-for-coding` | Kimi model ID |
+| `MESH_SYNTHETIC_PROVIDER` | `synthetic` | GLM provider name (change only for custom proxies) |
+| `MESH_MODEL_GLM` | `hf:zai-org/GLM-5.1` | GLM model ID |
+| `MESH_SYSTEM_PROMPT` | `You are a helpful coding assistant.` | System prompt for worker calls |
+| `SYNTHETIC_BASE_URL` | `https://api.synthetic.new/v1` | Override Synthetic API URL (only when `MESH_SYNTHETIC_PROVIDER` is changed) |
+| `SYNTHETIC_API_KEY_ENV` | `SYNTHETIC_API_KEY` | Env var name for Synthetic API key (only for custom provider bridge) |
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Error: model not found (...)` | Run `/model` to check exact provider/model IDs, then set `MESH_PROVIDER_*` / `MESH_MODEL_*` env vars |
+| `401 Invalid API Key` on `@glm` | Ensure `synthetic` credentials exist in `~/.pi/agent/auth.json` or `SYNTHETIC_API_KEY` is set |
+| Codex says model unsupported | Switch to a model your plan supports, e.g. `MESH_MODEL_CODEX=gpt-5.3-codex` |
+| Kimi auth fails intermittently | Use `/login kimi-coding`; don't rely on a stale `KIMI_API_KEY` |
+| Tags do nothing | Make sure there's text after the tags, e.g. `@claude hello` not just `@claude` |
+
+---
+
+## Contributing
+
+1. Fork the repo
+2. Create a feature branch (`git checkout -b feat/my-feature`)
+3. Make your changes — keep defaults overridable via env vars, don't commit secrets
+4. Run `npm run check` to validate TypeScript
+5. Push and open a PR
+
+---
+
+## License
+
+[MIT](./LICENSE) © 2026 PF Goriaux
