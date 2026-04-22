@@ -351,6 +351,12 @@ function buildJudgePrompt(userPrompt: string, outputs: Partial<Record<Alias, str
   ].join("\n");
 }
 
+const CWD_GUARD_WORKER_PROMPT =
+  "You are RESTRICTED to the current working directory and its subdirectories. " +
+  "Do NOT access, read, write, or navigate to any path outside the cwd. " +
+  "Do not use `cd ..`, absolute paths to parent directories, or any path that resolves outside the cwd. " +
+  "If you need files from outside the cwd, state that you cannot access them.";
+
 function applyWorkerInstructions(prompt: string): string {
   const contextBlock = buildParentContextBlock();
   const parts: string[] = [];
@@ -358,6 +364,11 @@ function applyWorkerInstructions(prompt: string): string {
   if (LEGACY_WORKER_INSTRUCTIONS) {
     parts.push("# Additional model-mesh instructions", LEGACY_WORKER_INSTRUCTIONS);
   }
+
+  // Inject cwd guard for workers (they don't load extensions, so
+  // they miss the cwd-guard extension's tool_call interception).
+  // The CWD_GUARD_WORKER_PROMPT tells the LLM to self-restrict.
+  parts.push("# CWD Guard", CWD_GUARD_WORKER_PROMPT);
 
   if (contextBlock) {
     parts.push(contextBlock);
