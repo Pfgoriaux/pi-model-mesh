@@ -1,5 +1,13 @@
-import type { ImageContent, Model } from "@mariozechner/pi-ai";
-import { buildSessionContext, createAgentSession, SessionManager, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { streamSimple, type ImageContent, type Message, type Model } from "@mariozechner/pi-ai";
+import {
+  buildSessionContext,
+  createAgentSessionFromServices,
+  createAgentSessionServices,
+  SessionManager,
+  type AgentSessionServices,
+  type BuildSystemPromptOptions,
+  type ExtensionAPI,
+} from "@mariozechner/pi-coding-agent";
 
 type Alias = "claude" | "codex" | "kimi" | "glm";
 
@@ -26,6 +34,7 @@ const SYNTHETIC_GLM_PROVIDER = process.env.MESH_SYNTHETIC_PROVIDER?.trim() || "s
 const SYNTHETIC_BASE_URL = process.env.SYNTHETIC_BASE_URL?.trim() || "https://api.synthetic.new/v1";
 const SYNTHETIC_API_KEY_ENV = process.env.SYNTHETIC_API_KEY_ENV?.trim() || "SYNTHETIC_API_KEY";
 const LEGACY_WORKER_INSTRUCTIONS = process.env.MESH_SYSTEM_PROMPT?.trim();
+const LEGACY_SYSTEM_PROMPT = "You are a helpful coding assistant.";
 
 const MODEL_MAP: Record<Alias, ModelBinding> = {
   claude: {
@@ -52,17 +61,120 @@ const MODEL_MAP: Record<Alias, ModelBinding> = {
 
 const ORDER: Alias[] = ["claude", "codex", "kimi", "glm"];
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
-const FULL_TOOLS = ["read", "grep", "find", "ls", "bash", "edit", "write"] as const;
 
 function parseWorkerToolMode(value: string | undefined): WorkerToolMode {
   const normalized = value?.trim().toLowerCase();
   if (normalized === "none") return "none";
   if (normalized === "full") return "full";
   if (normalized === "readonly" || normalized === "read-only" || normalized === "read_only") return "read-only";
-  return "read-only";
+  // Default changed from read-only to full so workers have the same tool access as the main pi session.
+  return "full";
 }
 
 const WORKER_TOOL_MODE = parseWorkerToolMode(process.env.MESH_TOOL_MODE);
+
+/**
+ * Returns the tool allowlist for `createAgentSessionFromServices({ tools })`.
+ *
+ * - `full`   → undefined  (pi enables ALL default built-in tools: read, bash, edit, write, grep, find, ls)
+ * - `read-only` → ["read","grep","find","ls"]
+ * - `none`   → []          (no tools)
+ *
+ * Returning `undefined` is the key to full parity: when `tools` is omitted,
+ * pi activates every built-in tool, exactly like a fresh `pi` launch.
+ */
+function getWorkerToolNames(mode: WorkerToolMode): string[] | undefined {
+  if (mode === "none") return [];
+  if (mode === "full") return undefined;
+  return [...READ_ONLY_TOOLS];
+}
+
+// ---------------------------------------------------------------------------
+// Worker services cache
+// ---------------------------------------------------------------------------
+// Creating an AgentSessionServices (resource-loader + model-registry + auth +
+// settings) is expensive.  We cache it per session so all parallel workers
+// reuse the same services — the model-registry is shared with the parent
+// (same providers, same API keys) and the resource-loader has
+// `noExtensions: true` (prevents model-mesh from loading inside workers).
+
+let workerServices: AgentSessionServices | undefined;
+
+async function getWorkerServices(
+  cwd: string,
+  modelRegistry: ExtensionAPI extends (api: infer A) => void
+    ? A
+    : unknown,
+): Promise<AgentSessionServices> {
+  if (workerServices) return workerServices;
+
+  const services = await createAgentSessionServices({
+    cwd,
+    // Share the parent's model registry so workers have the exact same
+    // providers, models, and API keys as the main pi session.
+    modelRegistry: modelRegistry as any,
+    resourceLoaderOptions: {
+      // Critical: do NOT load extensions inside workers.
+      // Without this, model-mesh would be discovered and loaded in each
+      // worker session, potentially causing infinite recursion when a
+      // worker receives a prompt containing @-tags.
+      noExtensions: true,
+      // Everything else is left at defaults — the resource loader will
+      // still discover AGENTS.md / context files, skills, prompt
+      // templates, and themes, just like a fresh `pi` launch.
+    },
+  });
+
+  workerServices = services;
+  return services;
+}
+
+function invalidateWorkerServices(): void {
+  workerServices = undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Parent context capture
+// ---------------------------------------------------------------------------
+// Extensions in the parent session may modify the system prompt (e.g.
+// adding tool guidelines, custom rules, etc.).  Workers don't load
+// extensions (to prevent recursion), so they miss these modifications.
+// We capture a lightweight context summary from `before_agent_start` and
+// inject it into worker prompts so workers still benefit from the parent's
+// extension context.
+
+let capturedParentContext: {
+  contextFilePaths: string[];
+  skillNames: string[];
+  selectedTools: string[];
+  promptGuidelines: string[];
+} | undefined;
+
+function resetCapturedContext(): void {
+  capturedParentContext = undefined;
+}
+
+function buildParentContextBlock(): string {
+  if (!capturedParentContext) return "";
+  const parts: string[] = ["## Parent session context (from extensions)"];
+  if (capturedParentContext.contextFilePaths.length > 0) {
+    parts.push("Context files: " + capturedParentContext.contextFilePaths.join(", "));
+  }
+  if (capturedParentContext.skillNames.length > 0) {
+    parts.push("Skills: " + capturedParentContext.skillNames.join(", "));
+  }
+  if (capturedParentContext.selectedTools.length > 0) {
+    parts.push("Tools: " + capturedParentContext.selectedTools.join(", "));
+  }
+  if (capturedParentContext.promptGuidelines.length > 0) {
+    parts.push("Guidelines:\n" + capturedParentContext.promptGuidelines.map((g) => `- ${g}`).join("\n"));
+  }
+  return parts.length > 1 ? parts.join("\n") : "";
+}
+
+// ---------------------------------------------------------------------------
+// Input parsing
+// ---------------------------------------------------------------------------
 
 function stripTags(text: string): string {
   return text.replace(/(^|\s)@[a-zA-Z0-9:_-]+/g, " ").replace(/\s+/g, " ").trim();
@@ -113,6 +225,10 @@ function parseInput(text: string): {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 function textFromMessage(msg: { content?: Array<{ type: string; text?: string }> } | null | undefined): string {
   if (!msg?.content) return "";
   return msg.content
@@ -122,9 +238,75 @@ function textFromMessage(msg: { content?: Array<{ type: string; text?: string }>
     .trim();
 }
 
+function errorFromAssistantMessage(
+  msg:
+    | {
+        stopReason?: string;
+        errorMessage?: string;
+      }
+    | null
+    | undefined,
+): string {
+  if (!msg) return "";
+  if ((msg.stopReason === "error" || msg.stopReason === "aborted") && msg.errorMessage) {
+    return `Error: ${msg.errorMessage}`;
+  }
+  return "";
+}
+
+function textOrErrorFromAssistantMessage(
+  msg:
+    | {
+        content?: Array<{ type: string; text?: string }>;
+        stopReason?: string;
+        errorMessage?: string;
+      }
+    | null
+    | undefined,
+): string {
+  return textFromMessage(msg) || errorFromAssistantMessage(msg);
+}
+
 function cloneValue<T>(value: T): T {
   if (typeof globalThis.structuredClone === "function") return globalThis.structuredClone(value);
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function sanitizeWorkerHistory(history: unknown[]): unknown[] {
+  return history.filter((message) => {
+    if (!message || typeof message !== "object") return false;
+    const msg = message as { role?: string; customType?: string };
+    return !(msg.role === "custom" && msg.customType?.startsWith("model-mesh"));
+  });
+}
+
+function getWorkerThinkingLevel(
+  alias: Alias,
+  model: Model<any>,
+  thinkingLevel: ReturnType<ExtensionAPI["getThinkingLevel"]>,
+): ReturnType<ExtensionAPI["getThinkingLevel"]> {
+  // Kimi's anthropic-compatible coding endpoint currently rejects pi's
+  // forwarded reasoning fields, so force non-reasoning requests there.
+  if (alias === "kimi" || model.provider === MODEL_MAP.kimi.provider) return "off";
+  return thinkingLevel;
+}
+
+function normalizeWorkerOutcome(alias: Alias, model: Model<any>, outcome: string): string {
+  if (
+    alias === "claude" &&
+    model.provider === MODEL_MAP.claude.provider &&
+    /invalid x-api-key|authentication_error/i.test(outcome)
+  ) {
+    return [
+      `Error: Anthropic authentication failed.`,
+      `@claude defaults to ${MODEL_MAP.claude.provider}/${MODEL_MAP.claude.modelId}.`,
+      `If you're using Claude Pro/Max via /login anthropic, Anthropic third-party usage comes from extra usage and is billed per token, not your plan limits.`,
+      `Run '/login anthropic' in this same pi session or set ANTHROPIC_API_KEY. Manage extra usage at https://claude.ai/settings/usage.`,
+      ``,
+      `Raw upstream error: ${outcome.replace(/^Error:\s*/i, "")}`,
+    ].join("\n");
+  }
+  return outcome;
 }
 
 function buildDeliberationPrompt(userPrompt: string, last: MeshRound | undefined): string {
@@ -170,13 +352,37 @@ function buildJudgePrompt(userPrompt: string, outputs: Partial<Record<Alias, str
 }
 
 function applyWorkerInstructions(prompt: string): string {
-  if (!LEGACY_WORKER_INSTRUCTIONS) return prompt;
-  return [
-    "# Additional model-mesh instructions",
-    LEGACY_WORKER_INSTRUCTIONS,
-    "",
-    prompt,
-  ].join("\n");
+  const contextBlock = buildParentContextBlock();
+  const parts: string[] = [];
+
+  if (LEGACY_WORKER_INSTRUCTIONS) {
+    parts.push("# Additional model-mesh instructions", LEGACY_WORKER_INSTRUCTIONS);
+  }
+
+  if (contextBlock) {
+    parts.push(contextBlock);
+  }
+
+  if (parts.length > 0) {
+    return [...parts, "", prompt].join("\n");
+  }
+
+  return prompt;
+}
+
+function buildLegacyWorkerSystemPrompt(): string {
+  const contextBlock = buildParentContextBlock();
+  const parts: string[] = [];
+
+  if (LEGACY_WORKER_INSTRUCTIONS) {
+    parts.push(LEGACY_WORKER_INSTRUCTIONS);
+  }
+
+  if (contextBlock) {
+    parts.push(contextBlock);
+  }
+
+  return parts.length > 0 ? parts.join("\n\n") : LEGACY_SYSTEM_PROMPT;
 }
 
 function formatRound(round: MeshRound): string {
@@ -210,19 +416,87 @@ function updateLiveWidget(ctx: any, targets: Alias[], partials: Partial<Record<A
   ctx.ui.setWidget("model-mesh-live", lines, { placement: "belowEditor" });
 }
 
-function getWorkerTools(mode: WorkerToolMode): string[] {
-  if (mode === "none") return [];
-  return [...(mode === "full" ? FULL_TOOLS : READ_ONLY_TOOLS)];
-}
-
-function findLastAssistantText(messages: Array<{ role?: string; content?: Array<{ type: string; text?: string }> }>): string {
+function findLastAssistantOutcome(
+  messages: Array<{
+    role?: string;
+    content?: Array<{ type: string; text?: string }>;
+    stopReason?: string;
+    errorMessage?: string;
+  }>,
+): string {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     if (messages[i]?.role !== "assistant") continue;
-    const text = textFromMessage(messages[i]);
-    if (text) return text;
+    const outcome = textOrErrorFromAssistantMessage(messages[i]);
+    if (outcome) return outcome;
   }
   return "";
 }
+
+function shouldUseLegacyStreaming(alias: Alias, model: Model<any>, ctx: any): boolean {
+  if (alias === "kimi" || model.provider === MODEL_MAP.kimi.provider) return true;
+
+  const isUsingOAuth = (ctx.modelRegistry as { isUsingOAuth?: (m: Model<any>) => boolean }).isUsingOAuth?.(model) ?? false;
+  if (alias === "claude" && model.provider === MODEL_MAP.claude.provider && isUsingOAuth) return true;
+
+  return false;
+}
+
+async function runLegacyStreamModel(
+  model: Model<any>,
+  prompt: string,
+  ctx: any,
+  images: ImageContent[] | undefined,
+  onUpdate: (full: string) => void,
+): Promise<string> {
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok || !auth.apiKey) {
+    const msg = auth.ok ? `Missing API key for ${model.provider}/${model.id}` : auth.error;
+    throw new Error(msg);
+  }
+
+  const content: Array<{ type: "text"; text: string } | ImageContent> = [{ type: "text", text: prompt }];
+  if (images?.length) content.push(...images);
+
+  const user: Message = {
+    role: "user",
+    content,
+    timestamp: Date.now(),
+  };
+
+  const events = streamSimple(
+    model,
+    { systemPrompt: buildLegacyWorkerSystemPrompt(), messages: [user] },
+    {
+      apiKey: auth.apiKey,
+      headers: auth.headers,
+      signal: ctx.signal,
+    },
+  );
+
+  let full = "";
+  for await (const event of events) {
+    if (event.type === "text_delta") {
+      full += event.delta;
+      onUpdate(full);
+      continue;
+    }
+
+    if (event.type === "done") {
+      const doneText = textOrErrorFromAssistantMessage(event.message);
+      return doneText || full.trim();
+    }
+
+    if (event.type === "error") {
+      throw new Error(event.error.errorMessage || "Unknown streaming error");
+    }
+  }
+
+  return full.trim();
+}
+
+// ---------------------------------------------------------------------------
+// Worker session
+// ---------------------------------------------------------------------------
 
 async function runWorkerSession(
   model: Model<any>,
@@ -233,16 +507,60 @@ async function runWorkerSession(
   thinkingLevel: ReturnType<ExtensionAPI["getThinkingLevel"]>,
   onUpdate: (full: string) => void,
 ): Promise<string> {
-  // Use a real pi session so routed models inherit context files, skills, and workspace tools.
-  const { session } = await createAgentSession({
-    cwd: ctx.cwd,
+  // Get (or create) cached services shared across all workers.
+  // Uses the parent's modelRegistry so workers have the exact same
+  // providers / API keys as the main pi session.
+  // Resource loader has noExtensions: true to prevent model-mesh
+  // from loading inside workers (which would cause recursion).
+  let services: AgentSessionServices;
+  try {
+    services = await getWorkerServices(ctx.cwd, ctx.modelRegistry);
+  } catch (err) {
+    // If service creation fails (e.g. incompatible modelRegistry),
+    // fall back to creating a session without shared services.
+    // This gives workers a fresh ModelRegistry — they may lack
+    // custom providers, but at least they can still run.
+    const { session: fallbackSession } = await createAgentSessionFromServices({
+      services: await createAgentSessionServices({
+        cwd: ctx.cwd,
+        resourceLoaderOptions: { noExtensions: true },
+      }),
+      sessionManager: SessionManager.inMemory(ctx.cwd),
+      model,
+      thinkingLevel,
+      tools: getWorkerToolNames(WORKER_TOOL_MODE),
+    });
+    // Best-effort: attempt the prompt anyway
+    try {
+      await fallbackSession.prompt(prompt, { images, source: "extension" });
+    } finally {
+      fallbackSession.dispose();
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    return `Error: worker services init failed (${msg})`;
+  }
+
+  const toolNames = getWorkerToolNames(WORKER_TOOL_MODE);
+
+  const { session } = await createAgentSessionFromServices({
+    services,
+    sessionManager: SessionManager.inMemory(ctx.cwd),
     model,
     thinkingLevel,
-    sessionManager: SessionManager.inMemory(ctx.cwd),
-    tools: getWorkerTools(WORKER_TOOL_MODE),
+    // undefined → all default built-in tools (same as fresh `pi` launch)
+    // string[] → allowlist only those tools
+    // []       → no tools at all
+    tools: toolNames,
   });
 
   try {
+    // Worker sessions are ephemeral. Clearing the per-session affinity ID avoids
+    // OpenAI-compatible prompt cache fields such as `prompt_cache_key`, which
+    // some providers (for example Kimi) reject.
+    session.agent.sessionId = undefined;
+
+    // Seed the worker with the parent's conversation history so it has
+    // the same context the user has been building up.
     for (const message of history) session.sessionManager.appendMessage(cloneValue(message) as any);
     session.agent.state.messages = cloneValue(history) as any;
 
@@ -251,7 +569,7 @@ async function runWorkerSession(
 
     const unsubscribe = session.subscribe((event) => {
       if (event.type === "message_start" && event.message.role === "assistant") {
-        streamingText = textFromMessage(event.message);
+        streamingText = textOrErrorFromAssistantMessage(event.message);
         if (streamingText) onUpdate(streamingText);
         return;
       }
@@ -263,7 +581,7 @@ async function runWorkerSession(
       }
 
       if (event.type === "message_end" && event.message.role === "assistant") {
-        finalText = textFromMessage(event.message) || streamingText;
+        finalText = textOrErrorFromAssistantMessage(event.message) || streamingText;
         if (finalText) onUpdate(finalText);
       }
     });
@@ -274,11 +592,15 @@ async function runWorkerSession(
       unsubscribe();
     }
 
-    return finalText || findLastAssistantText(session.messages as any) || streamingText.trim();
+    return finalText || findLastAssistantOutcome(session.messages as any) || streamingText.trim();
   } finally {
     session.dispose();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Extension entry point
+// ---------------------------------------------------------------------------
 
 export default function modelMeshExtension(pi: ExtensionAPI) {
   const rounds: MeshRound[] = [];
@@ -306,8 +628,12 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
     });
   }
 
+  // Reset caches on session lifecycle events
   pi.on("session_start", async (_event, ctx) => {
     rounds.length = 0;
+    invalidateWorkerServices();
+    resetCapturedContext();
+
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom" || entry.customType !== "model-mesh-round") continue;
       const data = entry.data as MeshRound | undefined;
@@ -316,10 +642,24 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
     }
   });
 
+  // Capture parent session context from extensions so workers benefit
+  // from extension-added context even though they don't load extensions.
+  pi.on("before_agent_start", async (event) => {
+    const opts: BuildSystemPromptOptions = event.systemPromptOptions;
+    capturedParentContext = {
+      contextFilePaths: (opts.contextFiles ?? []).map((f: any) => f.path ?? String(f)),
+      skillNames: (opts.skills ?? []).map((s: any) => s.name ?? String(s)),
+      selectedTools: opts.selectedTools ?? [],
+      promptGuidelines: opts.promptGuidelines ?? [],
+    };
+  });
+
   pi.registerCommand("mesh-clear", {
     description: "Clear model-mesh round cache for this session",
     handler: async (_args, ctx) => {
       rounds.length = 0;
+      invalidateWorkerServices();
+      resetCapturedContext();
       ctx.ui.notify("Model Mesh history cleared", "info");
     },
   });
@@ -327,11 +667,24 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
   pi.registerCommand("mesh-doctor", {
     description: "Diagnose model/auth wiring for @claude/@codex/@kimi/@glm",
     handler: async (_args, ctx) => {
+      const toolNames = getWorkerToolNames(WORKER_TOOL_MODE);
       const lines: string[] = [
         "Model Mesh doctor:",
-        `- workspace tools: ${WORKER_TOOL_MODE} (${getWorkerTools(WORKER_TOOL_MODE).join(", ") || "none"})`,
+        `- worker tool mode: ${WORKER_TOOL_MODE}${toolNames === undefined ? " (all built-in tools, same as fresh pi)" : ` (${toolNames.join(", ") || "none"})`}`,
+        `- worker services cached: ${workerServices ? "yes" : "no (will create on next @-tag use)"}`,
+        `- worker extensions: disabled (noExtensions: true, prevents recursion)`,
         `- cwd: ${ctx.cwd}`,
       ];
+
+      if (capturedParentContext) {
+        const cc = capturedParentContext;
+        lines.push(`- parent context captured: yes`);
+        if (cc.contextFilePaths.length) lines.push(`  context files: ${cc.contextFilePaths.join(", ")}`);
+        if (cc.skillNames.length) lines.push(`  skills: ${cc.skillNames.join(", ")}`);
+        if (cc.promptGuidelines.length) lines.push(`  guidelines: ${cc.promptGuidelines.length} bullet(s)`);
+      } else {
+        lines.push(`- parent context captured: no (send a prompt first)`);
+      }
 
       for (const alias of ORDER) {
         const bind = MODEL_MAP[alias];
@@ -381,10 +734,13 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
     };
 
     const last = rounds.at(-1);
-    const workerPrompt = applyWorkerInstructions(parsed.deliberation
+    const basePrompt = parsed.deliberation
       ? buildDeliberationPrompt(parsed.cleanedPrompt, last)
-      : parsed.cleanedPrompt);
-    const history = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages as unknown[];
+      : parsed.cleanedPrompt;
+    const workerPrompt = applyWorkerInstructions(basePrompt);
+    const history = sanitizeWorkerHistory(
+      buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages as unknown[],
+    );
     const thinkingLevel = pi.getThinkingLevel();
 
     const partials: Partial<Record<Alias | "judge", string>> = {};
@@ -409,11 +765,24 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
           }
 
           try {
-            const txt = await runWorkerSession(model, workerPrompt, ctx, history, event.images, thinkingLevel, (full) => {
-              partials[alias] = full;
-              updateLiveWidget(ctx, parsed.targets, partials);
-            });
-            return [alias, txt || "(empty response)"] as const;
+            const txt = shouldUseLegacyStreaming(alias, model, ctx)
+              ? await runLegacyStreamModel(model, basePrompt, ctx, event.images, (full) => {
+                  partials[alias] = full;
+                  updateLiveWidget(ctx, parsed.targets, partials);
+                })
+              : await runWorkerSession(
+                  model,
+                  workerPrompt,
+                  ctx,
+                  history,
+                  event.images,
+                  getWorkerThinkingLevel(alias, model, thinkingLevel),
+                  (full) => {
+                    partials[alias] = full;
+                    updateLiveWidget(ctx, parsed.targets, partials);
+                  },
+                );
+            return [alias, normalizeWorkerOutcome(alias, model, txt || "(empty response)")] as const;
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
 
@@ -422,19 +791,32 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
               const fallback = ctx.modelRegistry.find("synthetic", bind.modelId);
               if (fallback) {
                 try {
-                  const txt = await runWorkerSession(fallback, workerPrompt, ctx, history, event.images, thinkingLevel, (full) => {
-                    partials[alias] = full;
-                    updateLiveWidget(ctx, parsed.targets, partials);
-                  });
-                  return [alias, txt || "(empty response)"] as const;
+                  const txt = shouldUseLegacyStreaming(alias, fallback, ctx)
+                    ? await runLegacyStreamModel(fallback, basePrompt, ctx, event.images, (full) => {
+                        partials[alias] = full;
+                        updateLiveWidget(ctx, parsed.targets, partials);
+                      })
+                    : await runWorkerSession(
+                        fallback,
+                        workerPrompt,
+                        ctx,
+                        history,
+                        event.images,
+                        getWorkerThinkingLevel(alias, fallback, thinkingLevel),
+                        (full) => {
+                          partials[alias] = full;
+                          updateLiveWidget(ctx, parsed.targets, partials);
+                        },
+                      );
+                  return [alias, normalizeWorkerOutcome(alias, fallback, txt || "(empty response)")] as const;
                 } catch (retryErr) {
                   const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-                  return [alias, `Error: ${retryMsg}`] as const;
+                  return [alias, normalizeWorkerOutcome(alias, fallback, `Error: ${retryMsg}`)] as const;
                 }
               }
             }
 
-            return [alias, `Error: ${message}`] as const;
+            return [alias, normalizeWorkerOutcome(alias, model, `Error: ${message}`)] as const;
           }
         }),
       );
@@ -450,10 +832,29 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
         } else {
           const judgePrompt = applyWorkerInstructions(buildJudgePrompt(parsed.cleanedPrompt, round.outputs, parsed.chosenJudge));
           try {
-            const judged = await runWorkerSession(judgeModel, judgePrompt, ctx, history, event.images, thinkingLevel, (full) => {
-              partials.judge = full;
-              updateLiveWidget(ctx, parsed.targets, partials);
-            });
+            const judged = shouldUseLegacyStreaming(parsed.chosenJudge, judgeModel, ctx)
+              ? await runLegacyStreamModel(
+                  judgeModel,
+                  buildJudgePrompt(parsed.cleanedPrompt, round.outputs, parsed.chosenJudge),
+                  ctx,
+                  event.images,
+                  (full) => {
+                    partials.judge = full;
+                    updateLiveWidget(ctx, parsed.targets, partials);
+                  },
+                )
+              : await runWorkerSession(
+                  judgeModel,
+                  judgePrompt,
+                  ctx,
+                  history,
+                  event.images,
+                  getWorkerThinkingLevel(parsed.chosenJudge, judgeModel, thinkingLevel),
+                  (full) => {
+                    partials.judge = full;
+                    updateLiveWidget(ctx, parsed.targets, partials);
+                  },
+                );
             round.judged = judged || "(empty judgment)";
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
