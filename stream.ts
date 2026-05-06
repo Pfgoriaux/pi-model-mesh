@@ -221,6 +221,7 @@ async function getWorkerServices(cwd: string, modelRegistry: any): Promise<Agent
 
 export function invalidateWorkerServices(): void {
   workerServices = null;
+  invalidateProjectContextCache();
 }
 
 // ---------------------------------------------------------------------------
@@ -367,18 +368,20 @@ export async function runModelWithFallback(
   logger: MeshLogger,
   /** Optional: called when falling back to legacy (for UI notifications) */
   onFallback?: (workerMsg: string) => void,
+  /** Optional: abort signal for the round (checked between phases, passed to streams) */
+  signal?: AbortSignal,
 ): Promise<string> {
   const route = getStreamingRoute(alias, model, ctx);
   status.streamPath = route.legacy ? "legacy" : "worker";
 
   if (route.legacy) {
     logger.log(alias, "warn", `Using legacy stream fallback — no tool access in this route`);
-    return runLegacyStreamModel(model, rawPrompt, ctx, images, onActivity, alias);
+    return runLegacyStreamModel(model, rawPrompt, ctx, images, onActivity, alias, signal);
   }
 
   try {
     return await runWorkerSession(
-      model, workerPrompt, ctx, history, images, thinkingLevel, onActivity, alias,
+      model, workerPrompt, ctx, history, images, thinkingLevel, onActivity, alias, signal,
     );
   } catch (workerErr) {
     const workerMsg = workerErr instanceof Error ? workerErr.message : String(workerErr);
@@ -389,7 +392,7 @@ export async function runModelWithFallback(
       status.activeToolName = null;
       status.isThinking = false;
       onFallback?.(workerMsg);
-      return runLegacyStreamModel(model, rawPrompt, ctx, images, onActivity, alias);
+      return runLegacyStreamModel(model, rawPrompt, ctx, images, onActivity, alias, signal);
     }
     throw workerErr;
   }
@@ -406,6 +409,7 @@ async function runLegacyStreamModel(
   images: ImageContent[] | undefined,
   onActivity: (event: StreamActivity) => void,
   alias: Alias | undefined,
+  signal?: AbortSignal,
 ): Promise<string> {
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok || !auth.apiKey) {
@@ -428,7 +432,7 @@ async function runLegacyStreamModel(
     {
       apiKey: auth.apiKey,
       headers: auth.headers,
-      signal: ctx.signal,
+      signal: signal ?? ctx.signal,
     },
   );
 
@@ -479,6 +483,7 @@ async function runWorkerSession(
   thinkingLevel: ReturnType<ExtensionAPI["getThinkingLevel"]>,
   onActivity: (event: StreamActivity) => void,
   alias: Alias | undefined,
+  signal?: AbortSignal,
 ): Promise<string> {
   let services: AgentSessionServices;
   try {
@@ -586,6 +591,10 @@ async function runWorkerSession(
       }
     });
 
+    if (signal?.aborted) {
+      throw new Error("Aborted");
+    }
+
     try {
       await session.prompt(prompt, { images, source: "extension" });
     } finally {
@@ -609,7 +618,16 @@ async function runWorkerSession(
 // Project context injection (for legacy models with no tool access)
 // ---------------------------------------------------------------------------
 
+let projectContextCache: { cwd: string; result: string } | null = null;
+
+export function invalidateProjectContextCache(): void {
+  projectContextCache = null;
+}
+
 export function buildProjectContextSnippet(cwd: string): string {
+  if (projectContextCache && projectContextCache.cwd === cwd) {
+    return projectContextCache.result;
+  }
   const parts: string[] = ["## Project context (auto-injected for legacy models with no tools)"];
   try {
     const tree = execSync(
@@ -626,7 +644,9 @@ export function buildProjectContextSnippet(cwd: string): string {
   parts.push("");
   parts.push("NOTE: You do NOT have tool access in this mode. You cannot read files or run commands.");
   parts.push("If you need file contents, say so and the user can re-run with a model that has tools.");
-  return parts.join("\n");
+  const result = parts.join("\n");
+  projectContextCache = { cwd, result };
+  return result;
 }
 
 // ---------------------------------------------------------------------------

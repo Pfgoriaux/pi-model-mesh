@@ -9,7 +9,7 @@
 - `@glm`
 - `@all`
 - `@review` — full cross-verification review mode (all models + cross-check + consensus)
-- `@judge` / `@judge:<model>`
+- `@judge` / `@judge:<model>` — now supports `@judge:glm`
 - `@deliberate` / `@debate`
 
 ## Behavior contract
@@ -18,9 +18,16 @@
 - Run selected models in parallel.
 - Track per-worker lifecycle phases: `pending` → `starting` → `thinking` → `toolcalling` → `streaming` → `done` | `error`.
 - Show a rich live widget with phase icons (⏳🚀🧠🔧📡✅❌), elapsed time, char count, ttfb, and 300-char preview per model.
-- Throttle widget updates (default 150ms) to avoid TUI flooding.
+- Throttle widget updates (default 150ms) to avoid TUI flooding; **flush on completion** so widget never shows stale state.
 - Write structured timestamped logs to `~/.pi/agent/logs/model-mesh-<timestamp>.log` per round.
 - Persist round outputs in custom session entries (`model-mesh-round`).
+- **Custom message renderer** — themed, collapsible output via `registerMessageRenderer`. Compact summary by default; Ctrl+O to expand with accent-colored model tags and verdicts.
+- **`@` tag autocomplete** — `addAutocompleteProvider` offers `@claude`, `@codex`, `@glm`, `@all`, `@review`, `@judge`, `@deliberate` with descriptions.
+- **Round abort** — `/mesh-abort` command + `AbortController` with signal propagated to all worker sessions and legacy streams. Signal checked between phases.
+- **`ctx.hasUI` guards** — widget/status/notify calls skip when `!ctx.hasUI` (print/JSON/RPC modes).
+- **Session shutdown cleanup** — invalidates services, context cache, aborts running rounds, disposes logger.
+- **Command completions** — `/mesh-logs` and `/mesh-diff` auto-complete arguments.
+- **Project context caching** — `buildProjectContextSnippet` result cached per CWD; invalidated on `invalidateWorkerServices`.
 - **Review mode** (`@review`): 3-phase pipeline —
   1. All models independently review the code with structured findings (severities, verdicts, confidence)
   2. Each model cross-verifies the OTHER models' reviews (agree/disagree/missed)

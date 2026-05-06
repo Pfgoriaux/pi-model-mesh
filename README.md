@@ -289,6 +289,7 @@ Then in pi:
 |---|---|
 | `/mesh-doctor` | Diagnose provider/model binding, auth, tool mode, services cache, parent context capture, and logging config |
 | `/mesh-clear` | Clear in-session model-mesh round history and cached services |
+| `/mesh-abort` | Abort the currently running model-mesh round (saves tokens on Escape) |
 | `/mesh-diff` | Capture git diff and prepare it for `@review` (unstaged + staged by default, or specify a ref like `HEAD~1` or `main..HEAD`) |
 | `/mesh-logs` | Show recent in-memory log entries (last 50) from the latest round |
 | `/mesh-logs last` | Tail the latest log file from disk |
