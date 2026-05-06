@@ -1,7 +1,3 @@
-// ---------------------------------------------------------------------------
-// Shared type definitions for model-mesh
-// ---------------------------------------------------------------------------
-
 export type Alias = "claude" | "codex" | "glm";
 
 export type ModelBinding = {
@@ -10,11 +6,14 @@ export type ModelBinding = {
   label: string;
 };
 
+export type ResolvedBinding = ModelBinding & {
+  source: "env" | "cache" | "registry" | "fallback";
+};
+
 export type WorkerToolMode = "none" | "read-only" | "full";
 
 export type WorkerPhase = "pending" | "starting" | "thinking" | "toolcalling" | "streaming" | "done" | "error";
 
-/** Activity event emitted by both streaming paths */
 export type StreamActivity =
   | { kind: "text"; delta: string; full: string }
   | { kind: "thinking_start" }
@@ -94,3 +93,5 @@ export const PHASE_ICON: Record<WorkerPhase, string> = {
   done: "✅",
   error: "❌",
 };
+
+export type LabelMap = Record<Alias, string>;

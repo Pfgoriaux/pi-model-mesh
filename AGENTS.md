@@ -12,55 +12,91 @@
 - `@judge` / `@judge:<model>` — now supports `@judge:glm`
 - `@deliberate` / `@debate`
 
+## Architecture
+
+All source lives under `src/`:
+
+```
+src/
+  index.ts           — extension registration (thin entrypoint)
+  types.ts           — shared types, ResolvedBinding, LabelMap
+  input/parse.ts     — tag parsing and input normalization
+  commands/           — /mesh-abort, /mesh-clear, /mesh-doctor, /mesh-logs, /mesh-diff
+  orchestration/      — runWorker, runPhaseWorker, modes/review, modes/deliberation, modes/judge
+  models/aliases.ts   — alias-to-family mapping, ORDER, fallback hints
+  models/resolve.ts   — dynamic resolution from ctx.modelRegistry
+  models/cache.ts     — read/write cached provider+model in agent dir
+  models/labels.ts    — display labels derived from resolved model
+  config/env.ts       — env parsing only
+  config/paths.ts     — SDK-based paths (getAgentDir)
+  render/widget.ts    — live widget
+  render/output.ts    — final message formatting
+  render/text.ts      — formatElapsed, preview, createWorkerStatus, markDone, markError
+  prompts/             — system, review, deliberation, judge, worker
+  stream/              — logger, progress, activity, fallback, context, messages, project
+```
+
 ## Behavior contract
 
 - Parse tags from user input in `input` hook.
 - Run selected models in parallel.
 - Track per-worker lifecycle phases: `pending` → `starting` → `thinking` → `toolcalling` → `streaming` → `done` | `error`.
-- Show a rich live widget with phase icons (⏳🚀🧠🔧📡✅❌), elapsed time, char count, ttfb, and 300-char preview per model.
-- Throttle widget updates (default 150ms) to avoid TUI flooding; **flush on completion** so widget never shows stale state.
-- Write structured timestamped logs to `~/.pi/agent/logs/model-mesh-<timestamp>.log` per round.
+- Show a compact live widget with phase icons, elapsed time, and activity per model.
+- Throttle widget updates (default 150ms); flush on completion.
+- Write structured timestamped logs to `<agentDir>/logs/model-mesh-<timestamp>.log` per round.
 - Persist round outputs in custom session entries (`model-mesh-round`).
-- **Custom message renderer** — themed, collapsible output via `registerMessageRenderer`. Compact summary by default; Ctrl+O to expand with accent-colored model tags and verdicts.
-- **`@` tag autocomplete** — `addAutocompleteProvider` offers `@claude`, `@codex`, `@glm`, `@all`, `@review`, `@judge`, `@deliberate` with descriptions.
-- **Round abort** — `/mesh-abort` command + `AbortController` with signal propagated to all worker sessions and legacy streams. Signal checked between phases.
-- **`ctx.hasUI` guards** — widget/status/notify calls skip when `!ctx.hasUI` (print/JSON/RPC modes).
-- **Session shutdown cleanup** — invalidates services, context cache, aborts running rounds, disposes logger.
-- **Command completions** — `/mesh-logs` and `/mesh-diff` auto-complete arguments.
-- **Project context caching** — `buildProjectContextSnippet` result cached per CWD; invalidated on `invalidateWorkerServices`.
-- **Review mode** (`@review`): 3-phase pipeline —
-  1. All models independently review the code with structured findings (severities, verdicts, confidence)
-  2. Each model cross-verifies the OTHER models' reviews (agree/disagree/missed)
-  3. Consensus synthesis producing agreements, disagreements, action items, verdict matrix, and final recommendation
-- **Deliberation mode** (`@deliberate` / `@debate`): 4-phase pipeline —
-  1. All models independently propose solutions (approach, implementation plan, tradeoffs, risks, confidence)
-  2. Each model cross-critiques the others' proposals (strengths, weaknesses, missed, hybrid idea)
-  3. Each model refines their proposal incorporating the best from all models
-  4. **Democratic synthesis** — ALL models produce their own synthesis in parallel (no single judge). A converged plan is extracted from their consensus, with agreements, disagreements, each model's contribution, and overall confidence score. No model owns the final answer alone.
-- Support judge mode to synthesize final decision (standalone, not in review/deliberation modes).
-- Provide `/mesh-logs`, `/mesh-logs last`, `/mesh-logs clear` commands for log inspection.
-- Provide `/mesh-diff` command for git diff injection into review mode.
+- Custom message renderer — themed, collapsible output. Compact summary by default; Ctrl+O to expand.
+- `@` tag autocomplete for all supported tags.
+- Round abort via `/mesh-abort` + `AbortController`.
+- `ctx.hasUI` guards on all widget/status/notify calls.
+- Session shutdown cleanup — invalidates services, context cache, aborts running rounds, disposes logger.
+- Project context caching — `buildProjectContextSnippet` cached per CWD; uses Node fs traversal (no child_process).
+- Review mode (`@review`): 3-phase pipeline — independent review → cross-verification → consensus synthesis.
+- Deliberation mode (`@deliberate` / `@debate`): 4-phase pipeline — proposals → cross-critique → convergence → democratic synthesis.
+- Judge mode for standalone final decision synthesis.
+- `/mesh-logs`, `/mesh-logs last`, `/mesh-logs clear` for log inspection.
+- `/mesh-diff` for git diff injection into review mode (only remaining child_process use, for git CLI).
+
+## Dynamic model resolution
+
+Models are **not** hardcoded. On each round, `resolveAllAliases` resolves each alias through:
+
+1. **Env override** — `MESH_PROVIDER_<ALIAS>` / `MESH_MODEL_<ALIAS>` if set
+2. **Cached binding** — from `<agentDir>/model-mesh/resolved-models.json` (validated against registry)
+3. **Registry lookup** — search `ctx.modelRegistry.getAvailable()` by family patterns
+4. **Fallback hints** — legacy defaults as last resort
+
+Resolved bindings are threaded through workers, prompts, doctor, and rendering. Labels come from the resolved model's `name` field, not static constants.
 
 ## Worker session architecture
 
 Workers are created via `createAgentSessionFromServices` with cached `AgentSessionServices`:
 
-- **Shared modelRegistry** — workers use the parent's `ctx.modelRegistry` so they have the exact same providers, models, and API keys.
-- **noExtensions: true** — extensions are NOT loaded in workers to prevent model-mesh from recursively loading inside a worker session.
-- **Full tools by default** — `MESH_TOOL_MODE` defaults to `full`, which explicitly passes all 7 built-in tool names (`read, bash, edit, write, grep, find, ls`) to `createAgentSessionFromServices`. This gives workers more capability than a default `pi` launch (which only enables `read, bash, edit, write`).
-- **Resource discovery** — the resource loader still discovers AGENTS.md, skills, prompt templates, and themes.
-- **Parent context injection** — a `before_agent_start` handler captures the parent's extension context (context files, skills, guidelines) and injects it into worker prompts so workers benefit from extension-added context even though they don't run extensions.
-- **Services caching** — `AgentSessionServices` is created once per session and reused across all parallel workers.
-- **Cache invalidation** — services cache is cleared on `session_start` and `/mesh-clear`.
-- **Legacy fallback** — when a worker session fails with a provider-incompat error (auth failure, API rejection, etc.), model-mesh automatically falls back to the legacy `streamSimple` path which has NO tool access. When this happens, the user sees a warning notification. Use `/mesh-logs last` or `/mesh-doctor` to diagnose why the worker session failed.
+- **Shared modelRegistry** — workers use the parent's `ctx.modelRegistry`.
+- **noExtensions: true** — prevents recursive loading.
+- **Full tools by default** — `MESH_TOOL_MODE` defaults to `full` (all 7 built-in tools).
+- **Parent context injection** — `before_agent_start` captures context and injects into worker prompts.
+- **Services caching** — created once per session, reused across workers.
+- **Legacy fallback** — auto-falls back to `streamSimple` (no tools) on compat errors.
 
-## Provider defaults
+## Paths
+
+All filesystem paths use Pi SDK helpers (`getAgentDir` from `@mariozechner/pi-coding-agent`):
+
+- Logs: `<agentDir>/logs/`
+- Model cache: `<agentDir>/model-mesh/resolved-models.json`
+
+No direct `os.homedir()` or hardcoded `~/.pi/agent` paths.
+
+## Fallback hints (legacy compatibility)
+
+These are only used when dynamic resolution finds nothing in the registry:
 
 - Claude: `anthropic/claude-opus-4-7`
 - Codex: `openai-codex/gpt-5.3-codex`
 - GLM via Synthetic: `synthetic/hf:zai-org/GLM-5.1`
 
-Everything must stay overridable via env vars.
+Everything stays overridable via env vars.
 
 ## Safety and OSS rules
 
@@ -71,11 +107,15 @@ Everything must stay overridable via env vars.
 
 ## Environment variables (beyond the README table)
 
-These internal tuning knobs are documented here for contributors:
-
 | Variable | Default | Purpose |
 |---|---|---|
-| `MESH_LEGACY_CLAUDE_OAUTH` | `false` | Force legacy streaming for Claude OAuth sessions (auto-detected by default) |
-| `MESH_FORCE_WORKER_SESSION` | `false` | Force ALL models through worker-session path, disabling legacy fallback |
+| `MESH_LEGACY_CLAUDE_OAUTH` | `false` | Force legacy streaming for Claude OAuth sessions |
+| `MESH_FORCE_WORKER_SESSION` | `false` | Force ALL models through worker-session path |
 | `MESH_LOG_INTERVAL_MS` | `3000` | Minimum ms between progress log entries per worker |
 | `MESH_LOG_INTERVAL_CHARS` | `500` | Minimum chars between progress log entries per worker |
+| `MESH_PROVIDER_CLAUDE` | — | Override provider for @claude |
+| `MESH_MODEL_CLAUDE` | — | Override model id for @claude |
+| `MESH_PROVIDER_CODEX` | — | Override provider for @codex |
+| `MESH_MODEL_CODEX` | — | Override model id for @codex |
+| `MESH_PROVIDER_GLM` | — | Override provider for @glm |
+| `MESH_MODEL_GLM` | — | Override model id for @glm |

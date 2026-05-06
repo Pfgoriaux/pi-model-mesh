@@ -1,6 +1,6 @@
 {
   "name": "pi-model-mesh",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Multi-model orchestration extension for pi (@claude, @codex, @glm, @all, @review, @deliberate, @judge)",
   "license": "MIT",
   "type": "module",
@@ -23,22 +23,12 @@
     "claude"
   ],
   "files": [
-    "index.ts",
-    "types.ts",
-    "config.ts",
-    "prompts.ts",
-    "format.ts",
-    "stream.ts",
+    "src/",
     "README.md",
     "LICENSE"
   ],
   "exports": {
-    ".": "./index.ts",
-    "./types": "./types.ts",
-    "./config": "./config.ts",
-    "./prompts": "./prompts.ts",
-    "./format": "./format.ts",
-    "./stream": "./stream.ts"
+    ".": "./src/index.ts"
   },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
@@ -58,7 +48,7 @@
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./src/index.ts"
     ]
   },
   "devDependencies": {
