@@ -4,6 +4,7 @@
 // ---------------------------------------------------------------------------
 
 import { buildSessionContext, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Text } from "@mariozechner/pi-tui";
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -48,6 +49,7 @@ import {
   preview,
   createWorkerStatus,
   createThrottledUpdater,
+  type ThrottledUpdater,
   updateLiveWidget,
   formatRound,
   parseConsensusFromText,
@@ -66,6 +68,7 @@ import {
   normalizeWorkerOutcome,
   getStreamingRoute,
   invalidateWorkerServices,
+  invalidateProjectContextCache,
   resetCapturedContext,
   buildParentContextBlock,
   captureParentContext,
@@ -108,7 +111,7 @@ function parseInput(text: string): {
   const judgeMode = Boolean(judgeToken) || reviewMode || deliberationMode;
 
   let chosenJudge: Alias | null = null;
-  const judgeInline = judgeToken?.match(/^judge[:_-](claude|codex)$/i);
+  const judgeInline = judgeToken?.match(/^judge[:_-](claude|codex|glm)$/i);
   if (judgeInline) {
     chosenJudge = judgeInline[1].toLowerCase() as Alias;
   }
@@ -117,7 +120,7 @@ function parseInput(text: string): {
   if (targets.length === 0 && (judgeMode || reviewMode || deliberationMode)) targets = [...ORDER];
 
   if (!chosenJudge && judgeMode) {
-    const explicitJudgeInText = text.match(/\bjudge\s*[=:]\s*(claude|codex)\b/i);
+    const explicitJudgeInText = text.match(/\bjudge\s*[=:]\s*(claude|codex|glm)\b/i);
     if (explicitJudgeInText) chosenJudge = explicitJudgeInText[1].toLowerCase() as Alias;
   }
 
@@ -153,9 +156,10 @@ async function runWorker(
   logger: MeshLogger,
   statuses: Partial<Record<Alias | "judge", WorkerStatus>>,
   partials: Partial<Record<Alias | "judge", string>>,
-  throttledUpdate: (fn: () => void) => void,
+  throttledUpdate: ThrottledUpdater,
   doUpdateWidget: () => void,
   partialFormatter?: (full: string) => string,
+  signal?: AbortSignal,
 ): Promise<[Alias, string]> {
   const bind = MODEL_MAP[alias];
   const status = statuses[alias]!;
@@ -208,8 +212,9 @@ async function runWorker(
         } else if (/invalid x-api-key|authentication_error/i.test(workerMsg)) {
           hint = " Set ANTHROPIC_API_KEY or run '/login anthropic'.";
         }
-        ctx.ui.notify(`@${alias}: Worker session failed (${preview(workerMsg, 120)}). Falling back to legacy — no tool access.${hint}`, "warning");
+        if (ctx.hasUI) ctx.ui.notify(`@${alias}: Worker session failed (${preview(workerMsg, 120)}). Falling back to legacy — no tool access.${hint}`, "warning");
       },
+      signal,
     );
 
     const outcome = normalizeWorkerOutcome(alias, model, txt || "(empty response)");
@@ -232,7 +237,7 @@ async function runWorker(
           status.streamPath = "worker";
           const fallbackWorkerPrompt = applyWorkerInstructions(basePrompt, alias, buildParentContextBlock);
           const onRetryActivity = createActivityHandler({ status, partials, alias, progress, logger, partialFormatter });
-          const txt = await runModelWithFallback(alias, fallback, basePrompt, fallbackWorkerPrompt, ctx, history, event.images, getWorkerThinkingLevel(alias, fallback, thinkingLevel), onRetryActivity, status, logger);
+          const txt = await runModelWithFallback(alias, fallback, basePrompt, fallbackWorkerPrompt, ctx, history, event.images, getWorkerThinkingLevel(alias, fallback, thinkingLevel), onRetryActivity, status, logger, undefined, signal);
           const outcome = normalizeWorkerOutcome(alias, fallback, txt || "(empty response)");
           markDone(status, outcome.length, partials, alias, outcome);
           logger.log(alias, "done", `Completed (synthetic fallback) in ${formatElapsed(status.finishedAt! - status.startedAt)} — ${outcome.length} chars`);
@@ -270,8 +275,9 @@ async function runPhaseWorker(
   logger: MeshLogger,
   statuses: Partial<Record<Alias | "judge", WorkerStatus>>,
   partials: Partial<Record<Alias | "judge", string>>,
-  throttledUpdate: (fn: () => void) => void,
+  throttledUpdate: ThrottledUpdater,
   doUpdateWidget: () => void,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   const bind = MODEL_MAP[alias];
   const model = ctx.modelRegistry.find(bind.provider, bind.modelId);
@@ -302,10 +308,11 @@ async function runPhaseWorker(
     const txt = await runModelWithFallback(
       alias, model, phasePrompt, workerPrompt, ctx, history, event.images,
       getWorkerThinkingLevel(alias, model, thinkingLevel), onActivity, phaseStatus, logger,
+      undefined, signal,
     );
 
     // Handle legacy fallback notification
-    if (phaseStatus.streamPath === "legacy") {
+    if (phaseStatus.streamPath === "legacy" && ctx.hasUI) {
       ctx.ui.notify(`@${alias}: Phase worker using legacy — no tool access.`, "warning");
     }
 
@@ -345,8 +352,9 @@ async function runSynthesisWorker(
   logger: MeshLogger,
   statuses: Partial<Record<Alias | "judge", WorkerStatus>>,
   partials: Partial<Record<Alias | "judge", string>>,
-  throttledUpdate: (fn: () => void) => void,
+  throttledUpdate: ThrottledUpdater,
   doUpdateWidget: () => void,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   const bind = MODEL_MAP[actualAlias];
   const model = ctx.modelRegistry.find(bind.provider, bind.modelId);
@@ -381,6 +389,7 @@ async function runSynthesisWorker(
     const fullText = await runModelWithFallback(
       actualAlias, model, synthesisPrompt, workerPrompt, ctx, history, event.images,
       getWorkerThinkingLevel(actualAlias, model, thinkingLevel), onActivity, synthStatus, logger,
+      undefined, signal,
     );
 
     synthStatus.phase = "done";
@@ -431,6 +440,85 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
     });
   }
 
+  // -----------------------------------------------------------------------
+  // Tag descriptions (shared by autocomplete + help)
+  // -----------------------------------------------------------------------
+
+  const TAG_DESCRIPTIONS: Record<string, string> = {
+    claude: "Route to Claude",
+    codex: "Route to Codex",
+    glm: "Route to GLM via Synthetic",
+    all: "Route to every model",
+    review: "Full review mode: all models + cross-verification + consensus",
+    judge: "After all models respond, one synthesizes a final decision",
+    "judge:claude": "Use Claude as the judge",
+    "judge:codex": "Use Codex as the judge",
+    "judge:glm": "Use GLM as the judge",
+    deliberate: "Full deliberation: proposals → cross-critique → convergence → plan",
+    debate: "Alias for @deliberate",
+  };
+
+  // -----------------------------------------------------------------------
+  // Custom message renderer for themed, collapsible output
+  // -----------------------------------------------------------------------
+
+  pi.registerMessageRenderer(CUSTOM_TYPE, (message, { expanded }, theme) => {
+    const detailType = (message.details as any)?.type;
+    const contentText = typeof message.content === "string" ? message.content : JSON.stringify(message.content);
+
+    // Diagnostic outputs (doctor, logs, diff)
+    if (detailType === "mesh-doctor" || detailType === "mesh-logs" ||
+        detailType === "mesh-logs-file" || detailType === "mesh-diff-result") {
+      const header = theme.fg("accent", "[model-mesh]");
+      return new Text(`${header} ${contentText}`, 0, 0);
+    }
+
+    // Round results
+    const round = message.details as MeshRound | undefined;
+    if (round?.targets) {
+      if (!expanded) {
+        const tagList = round.targets.map((t) => theme.fg("accent", `@${t}`)).join(", ");
+        const modeTag = round.review
+          ? theme.fg("warning", " (review)")
+          : round.deliberationReport
+            ? theme.fg("accent", " (deliberation)")
+            : "";
+        const judgeTag = round.judged ? theme.fg("success", " · ✓ judged") : "";
+        const outputCount = Object.keys(round.outputs).length;
+        const lines = [
+          theme.bold(theme.fg("accent", "Model Mesh")) + modeTag,
+          `${tagList}${judgeTag}`,
+          theme.fg("dim", `${outputCount} model(s) responded · Ctrl+O to expand`),
+        ];
+        return new Text(lines.join("\n"), 0, 0);
+      }
+
+      // Expanded: full output with accent theming on key patterns
+      let content = contentText;
+      content = content.replace(/^# Model Mesh(.*)$/gm, (_, rest: string) =>
+        theme.bold(theme.fg("accent", `# Model Mesh${rest}`)));
+      content = content.replace(/@claude/g, theme.fg("accent", "@claude"));
+      content = content.replace(/@codex/g, theme.fg("accent", "@codex"));
+      content = content.replace(/@glm/g, theme.fg("accent", "@glm"));
+      content = content.replace(/\bAPPROVE\b/g, theme.fg("success", "APPROVE"));
+      content = content.replace(/\bREQUEST_CHANGES\b/g, theme.fg("warning", "REQUEST_CHANGES"));
+      content = content.replace(/\bNEEDS_DISCUSSION\b/g, theme.fg("error", "NEEDS_DISCUSSION"));
+      content = content.replace(/\bMERGE\b/g, theme.fg("success", "MERGE"));
+      content = content.replace(/\bFIX_FIRST\b/g, theme.fg("warning", "FIX_FIRST"));
+      content = content.replace(/\bMAJOR_REWORK\b/g, theme.fg("error", "MAJOR_REWORK"));
+      return new Text(content, 0, 0);
+    }
+
+    // Fallback
+    return new Text(theme.fg("muted", contentText), 0, 0);
+  });
+
+  // -----------------------------------------------------------------------
+  // Autocomplete for @-tags
+  // -----------------------------------------------------------------------
+
+  const MESH_TAG_KEYS = Object.keys(TAG_DESCRIPTIONS);
+
   // Reset caches on session lifecycle events
   pi.on("session_start", async (_event, ctx) => {
     rounds.length = 0;
@@ -443,6 +531,33 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
       if (!data || !data.id || !Array.isArray(data.targets)) continue;
       rounds.push(data);
     }
+
+    // Autocomplete for @mesh tags
+    ctx.ui.addAutocompleteProvider((current) => ({
+      async getSuggestions(lines, cursorLine, cursorCol, options) {
+        const line = lines[cursorLine] ?? "";
+        const beforeCursor = line.slice(0, cursorCol);
+        const match = beforeCursor.match(/(?:^|[ \t])@([a-zA-Z:]*)$/);
+        if (!match) return current.getSuggestions(lines, cursorLine, cursorCol, options);
+        const prefix = match[1] ?? "";
+        const matching = MESH_TAG_KEYS.filter((t) => t.startsWith(prefix.toLowerCase()));
+        if (matching.length === 0) return current.getSuggestions(lines, cursorLine, cursorCol, options);
+        return {
+          prefix: `@${prefix}`,
+          items: matching.map((t) => ({
+            value: `@${t}`,
+            label: `@${t}`,
+            description: TAG_DESCRIPTIONS[t] || "",
+          })),
+        };
+      },
+      applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+        return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+      },
+      shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
+        return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
+      },
+    }));
   });
 
   // Capture parent session context from extensions
@@ -451,8 +566,32 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
+  // Session shutdown cleanup
+  // -----------------------------------------------------------------------
+
+  pi.on("session_shutdown", async () => {
+    invalidateWorkerServices();
+    invalidateProjectContextCache();
+    resetCapturedContext();
+    currentRoundAbort?.abort();
+    lastLogger?.dispose();
+  });
+
+  // -----------------------------------------------------------------------
   // Commands
   // -----------------------------------------------------------------------
+
+  pi.registerCommand("mesh-abort", {
+    description: "Abort the currently running model-mesh round",
+    handler: async (_args, ctx) => {
+      if (currentRoundAbort && !currentRoundAbort.signal.aborted) {
+        currentRoundAbort.abort();
+        ctx.ui.notify("Model Mesh round aborted", "warning");
+      } else {
+        ctx.ui.notify("No active mesh round to abort", "info");
+      }
+    },
+  });
 
   pi.registerCommand("mesh-clear", {
     description: "Clear model-mesh round cache for this session",
@@ -467,6 +606,11 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
   // /mesh-diff — auto-inject git diff for code review
   pi.registerCommand("mesh-diff", {
     description: "Run @review on git diff (unstaged changes by default, or specify a ref like HEAD~1 or main..HEAD)",
+    getArgumentCompletions: (prefix) => {
+      const refs = ["HEAD", "HEAD~1", "HEAD~2", "main", "main..HEAD", "master", "develop"];
+      const filtered = refs.filter((r) => r.toLowerCase().startsWith(prefix.toLowerCase()));
+      return filtered.length > 0 ? filtered.map((r) => ({ value: r, label: r })) : null;
+    },
     handler: async (args, ctx) => {
       const diffRef = args.trim() || "";
       let diffCommand: string;
@@ -591,6 +735,11 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
   // /mesh-logs
   pi.registerCommand("mesh-logs", {
     description: "Show recent model-mesh log entries (last 50) or open the latest log file",
+    getArgumentCompletions: (prefix) => {
+      const args = ["last", "latest", "file", "clear", "reset"];
+      const filtered = args.filter((a) => a.startsWith(prefix.toLowerCase()));
+      return filtered.length > 0 ? filtered.map((a) => ({ value: a, label: a })) : null;
+    },
     handler: async (args, ctx) => {
       const arg = args.trim().toLowerCase();
 
@@ -644,6 +793,7 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
   });
 
   let lastLogger: MeshLogger | undefined;
+  let currentRoundAbort: AbortController | null = null;
 
   // -----------------------------------------------------------------------
   // Main input handler
@@ -653,7 +803,7 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
     if (parsed.targets.length === 0) return { action: "continue" as const };
 
     if (!parsed.cleanedPrompt && !parsed.deliberation && !parsed.deliberationMode && !parsed.reviewMode) {
-      ctx.ui.notify("Add text after tags, e.g. @claude @codex propose migration strategy", "warning");
+      if (ctx.hasUI) ctx.ui.notify("Add text after tags, e.g. @claude @codex propose migration strategy", "warning");
       return { action: "handled" as const };
     }
 
@@ -690,6 +840,11 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
     );
     const thinkingLevel = pi.getThinkingLevel();
 
+    // --- Set up abort controller for the round ---
+    const abortController = new AbortController();
+    currentRoundAbort = abortController;
+    const roundSignal = abortController.signal;
+
     // --- Set up logger ---
     const logger = new MeshLogger(round.id);
     lastLogger = logger;
@@ -703,26 +858,28 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
     }
 
     const throttledUpdate = createThrottledUpdater(MESH_WIDGET_THROTTLE_MS);
-    const doUpdateWidget = () => updateLiveWidget(ctx, parsed.targets, statuses, partials);
+    const doUpdateWidget = () => { if (ctx.hasUI) updateLiveWidget(ctx, parsed.targets, statuses, partials); };
 
-    ctx.ui.setStatus("model-mesh", `Running ${parsed.targets.map((t) => `@${t}`).join(" ")}`);
+    if (ctx.hasUI) ctx.ui.setStatus("model-mesh", `Running ${parsed.targets.map((t) => `@${t}`).join(" ")}`);
     doUpdateWidget();
 
     try {
       // === Phase 1: Run all models in parallel ===
       const workers = await Promise.all(
         parsed.targets.map((alias) =>
-          runWorker(alias, basePrompt, ctx, event, history, thinkingLevel, logger, statuses, partials, throttledUpdate, doUpdateWidget),
+          runWorker(alias, basePrompt, ctx, event, history, thinkingLevel, logger, statuses, partials, throttledUpdate, doUpdateWidget, undefined, roundSignal),
         ),
       );
       for (const [alias, txt] of workers) round.outputs[alias] = txt;
+
+      if (roundSignal.aborted) throw new Error("Aborted");
 
       // ===============================================================
       // Cross-review phase (@review mode only)
       // ===============================================================
       if (parsed.reviewMode && parsed.targets.length >= 2) {
         logger.log("mesh", "info", `Cross-review phase starting — ${parsed.targets.length} models will verify each other`);
-        ctx.ui.setStatus("model-mesh", `Cross-review: ${parsed.targets.map((t) => `@${t}`).join(" ↔ ")}`);
+        if (ctx.hasUI) ctx.ui.setStatus("model-mesh", `Cross-review: ${parsed.targets.map((t) => `@${t}`).join(" ↔ ")}`);
 
         const crossReviewWorkers = await Promise.all(
           parsed.targets.map(async (reviewerAlias) => {
@@ -737,7 +894,7 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
             const crossReviewPrompt = buildCrossReviewPrompt(reviewerAlias, round.outputs, parsed.cleanedPrompt);
             const crossReviewText = await runPhaseWorker(
               reviewerAlias, crossReviewPrompt, "🔄", ctx, event, history, thinkingLevel,
-              logger, statuses, partials, throttledUpdate, doUpdateWidget,
+              logger, statuses, partials, throttledUpdate, doUpdateWidget, roundSignal,
             );
             if (!crossReviewText) return null;
 
@@ -756,16 +913,18 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
 
         logger.log("mesh", "info", `Cross-review phase completed — ${round.crossReviews.length} cross-reviews collected`);
 
+        if (roundSignal.aborted) throw new Error("Aborted");
+
         // --- Consensus synthesis ---
         if (round.crossReviews.length >= 2) {
           logger.log("mesh", "info", `Consensus synthesis phase starting`);
-          ctx.ui.setStatus("model-mesh", `Consensus synthesis`);
+          if (ctx.hasUI) ctx.ui.setStatus("model-mesh", `Consensus synthesis`);
 
           const consensusJudge = parsed.chosenJudge || "claude";
           const consensusPrompt = buildConsensusPrompt(parsed.cleanedPrompt, round.outputs, round.crossReviews);
           const fullConsensus = await runSynthesisWorker(
             "judge", consensusJudge, consensusPrompt, "🔄", ctx, event, history, thinkingLevel,
-            logger, statuses, partials, throttledUpdate, doUpdateWidget,
+            logger, statuses, partials, throttledUpdate, doUpdateWidget, roundSignal,
           );
 
           if (fullConsensus) {
@@ -785,7 +944,7 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
 
           // --- Phase 2: Cross-critique ---
           logger.log("mesh", "info", `Deliberation Phase 2: Cross-critique — ${activeOutputs.length} models critiquing each other`);
-          ctx.ui.setStatus("model-mesh", `Deliberation Phase 2: Cross-critique ${activeOutputs.map((t) => `@${t}`).join(" ↔ ")}`);
+          if (ctx.hasUI) ctx.ui.setStatus("model-mesh", `Deliberation Phase 2: Cross-critique ${activeOutputs.map((t) => `@${t}`).join(" ↔ ")}`);
 
           const critiqueWorkers = await Promise.all(
             parsed.targets.map(async (alias) => {
@@ -794,7 +953,7 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
               const critiquePrompt = buildDeliberationCritiquePrompt(alias, parsed.cleanedPrompt, round.outputs);
               const critiqueText = await runPhaseWorker(
                 alias, critiquePrompt, "💬", ctx, event, history, thinkingLevel,
-                logger, statuses, partials, throttledUpdate, doUpdateWidget,
+                logger, statuses, partials, throttledUpdate, doUpdateWidget, roundSignal,
               );
               if (!critiqueText) return null;
 
@@ -811,10 +970,12 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
           round.crossReviews = critiques;
           logger.log("mesh", "info", `Deliberation Phase 2 complete — ${critiques.length} critiques collected`);
 
+          if (roundSignal.aborted) throw new Error("Aborted");
+
           // --- Phase 3: Convergence ---
           if (critiques.length >= 2) {
             logger.log("mesh", "info", `Deliberation Phase 3: Convergence — models refine their proposals`);
-            ctx.ui.setStatus("model-mesh", `Deliberation Phase 3: Convergence`);
+            if (ctx.hasUI) ctx.ui.setStatus("model-mesh", `Deliberation Phase 3: Convergence`);
 
             const refinementWorkers = await Promise.all(
               parsed.targets.map(async (alias) => {
@@ -823,7 +984,7 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
                 const convergencePrompt = buildDeliberationConvergencePrompt(alias, parsed.cleanedPrompt, round.outputs, critiques);
                 const refinedText = await runPhaseWorker(
                   alias, convergencePrompt, "🎯", ctx, event, history, thinkingLevel,
-                  logger, statuses, partials, throttledUpdate, doUpdateWidget,
+                  logger, statuses, partials, throttledUpdate, doUpdateWidget, roundSignal,
                 );
                 return refinedText ? ([alias, refinedText] as const) : null;
               }),
@@ -836,11 +997,13 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
 
             logger.log("mesh", "info", `Deliberation Phase 3 complete — ${Object.keys(refinements).length} refined proposals collected`);
 
+            if (roundSignal.aborted) throw new Error("Aborted");
+
             // --- Phase 4: Democratic Synthesis ---
             const synthTargets = ORDER.filter((a) => refinements[a]);
             if (synthTargets.length >= 2) {
               logger.log("mesh", "info", `Deliberation Phase 4: Democratic Synthesis — ${synthTargets.length} models synthesizing in parallel`);
-              ctx.ui.setStatus("model-mesh", `Phase 4: Democratic Synthesis (${synthTargets.map((t) => `@${t}`).join(", ")})`);
+              if (ctx.hasUI) ctx.ui.setStatus("model-mesh", `Phase 4: Democratic Synthesis (${synthTargets.map((t) => `@${t}`).join(", ")})`);
 
               const synthesisOutputs: Partial<Record<Alias, string>> = {};
 
@@ -849,7 +1012,7 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
                   const synthPrompt = buildDeliberationSynthesisPrompt(parsed.cleanedPrompt, round.outputs, critiques, refinements);
                   const synthText = await runPhaseWorker(
                     alias, synthPrompt, "⚖️", ctx, event, history, thinkingLevel,
-                    logger, statuses, partials, throttledUpdate, doUpdateWidget,
+                    logger, statuses, partials, throttledUpdate, doUpdateWidget, roundSignal,
                   );
                   if (synthText) synthesisOutputs[alias] = synthText;
                   return synthText ? [alias, synthText] as const : null;
@@ -968,7 +1131,7 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
           const judgePromptText = buildJudgePrompt(parsed.cleanedPrompt, round.outputs, parsed.chosenJudge);
           const judged = await runSynthesisWorker(
             "judge", parsed.chosenJudge, judgePromptText, "⚖️", ctx, event, history, thinkingLevel,
-            logger, statuses, partials, throttledUpdate, doUpdateWidget,
+            logger, statuses, partials, throttledUpdate, doUpdateWidget, roundSignal,
           );
 
           if (judged) {
@@ -1002,8 +1165,12 @@ export default function modelMeshExtension(pi: ExtensionAPI) {
 
       return { action: "handled" as const };
     } finally {
-      ctx.ui.setStatus("model-mesh", undefined);
-      ctx.ui.setWidget("model-mesh-live", undefined);
+      currentRoundAbort = null;
+      if (ctx.hasUI) {
+        ctx.ui.setStatus("model-mesh", undefined);
+        ctx.ui.setWidget("model-mesh-live", undefined);
+      }
+      throttledUpdate.flush();
       logger.dispose();
     }
   });

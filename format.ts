@@ -159,15 +159,33 @@ export function updateLiveWidget(
 // Throttled updater
 // ---------------------------------------------------------------------------
 
-export function createThrottledUpdater(intervalMs: number): (fn: () => void) => void {
+export interface ThrottledUpdater {
+  (fn: () => void): void;
+  flush(): void;
+}
+
+export function createThrottledUpdater(intervalMs: number): ThrottledUpdater {
   let last = 0;
-  return (fn: () => void) => {
+  let pending: (() => void) | null = null;
+  const throttled = ((fn: () => void) => {
     const now = Date.now();
     if (now - last >= intervalMs) {
       last = now;
+      pending = null;
+      fn();
+    } else {
+      pending = fn;
+    }
+  }) as ThrottledUpdater;
+  throttled.flush = () => {
+    if (pending) {
+      const fn = pending;
+      pending = null;
+      last = Date.now();
       fn();
     }
   };
+  return throttled;
 }
 
 // ---------------------------------------------------------------------------
