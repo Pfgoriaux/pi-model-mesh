@@ -1,7 +1,7 @@
 {
   "name": "pi-model-mesh",
-  "version": "0.1.0",
-  "description": "Multi-model orchestration extension for pi (@claude, @codex, @kimi, @glm, @all, @judge)",
+  "version": "0.2.0",
+  "description": "Multi-model orchestration extension for pi (@claude, @codex, @glm, @all, @review, @deliberate, @judge)",
   "license": "MIT",
   "type": "module",
   "author": "PF Goriaux",
@@ -19,7 +19,6 @@
     "pi-coding-agent",
     "multi-model",
     "synthetic",
-    "kimi",
     "codex",
     "claude"
   ],
